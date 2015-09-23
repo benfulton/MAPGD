@@ -20,6 +20,8 @@ Output File: two columns of site identifiers; reference allele; major allele; mi
 */
 
 #include "estimate-individual.h"
+#include <ciso646>
+#include <mpi.h>
 
 #define BUFFER_SIZE 500
 #define PRAGMA
@@ -35,7 +37,7 @@ float_t compare (allele_stat mle1, allele_stat mle2, Locus &site1, Locus &site2,
 /// Estimates a number of summary statistics from short read sequences.
 /**
  */
-allele_stat estimate (Locus &site, models &model, std::vector<float_t> &gofs, const count_t &MIN, const float_t &EMLMIN, const float_t &MINGOF, const count_t &MAXPITCH){
+allele_stat estimate (Locus &site, models &model, std::vector<float_t> &gofs, const count_t &MIN, const float_t &EMLMIN, const float_t &MINGOF, const size_t &MAXPITCH){
 
 	allele_stat mle, temp;					//allele_stat is a basic structure that containes all the summary statistics for
 								//an allele. It gets passed around a lot, and a may turn it into a class that has
@@ -102,6 +104,59 @@ allele_stat estimate (Locus &site, models &model, std::vector<float_t> &gofs, co
 	return mle;
 }
 
+void write(std::ostream& out, uint32_t readed, profile& pro, profile& pro_out, allele_stat* buffer_mle, Locus* buffer_site, float MINGOF, float_t A)
+{
+	for (uint32_t x = 0; x < readed; ++x) {
+		// Now print everything to the *out stream, which could be a file or the stdout. 
+		//TODO move this over into a formated file.
+		//?
+		if (2 * (buffer_mle[x].ll - buffer_mle[x].monoll) >= A) {
+			out << std::fixed << std::setprecision(6) << pro.getids(buffer_site[x]) << '\t' << buffer_site[x].getname(0) << '\t' << buffer_site[x].getname_gt(1) << '\t';
+			out << std::fixed << std::setprecision(6) << buffer_mle[x] << std::endl;
+		}
+		if (buffer_mle[x].gof < -MINGOF) buffer_site[x].maskall();
+		if (pro_out.is_open()) {
+			buffer_site[x].id0 = pro_out.encodeid0(pro.decodeid0(buffer_site[x].id0));
+			pro_out.write(buffer_site[x]);
+		}
+	}
+}
+
+bool mpi_select(int lineid, int taskid, int num_tasks)
+{
+	lineid = lineid % (BUFFER_SIZE*num_tasks);
+	return lineid >= taskid*BUFFER_SIZE && lineid < (taskid + 1)*BUFFER_SIZE;
+}
+
+std::string mpi_recieve_string(int rank)
+{
+	MPI_Status status;
+	MPI_Probe(rank, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+	int count;
+	MPI_Get_count(&status, MPI_CHAR, &count);
+	char *buf = new char[count];
+	MPI_Recv(buf, count, MPI_CHAR, rank, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	std::string result(buf, count);
+	delete[] buf;
+	return result;
+}
+
+void do_estimate(allele_stat* buffer_mle, Locus& buffer_site, models& model, std::vector<int>& ind,
+	std::vector <float_t>& sum_gofs, std::vector <float_t>& gofs_read, count_t MIN, float_t EMLMIN, float_t MINGOF,
+	count_t MAXPITCH)
+{
+	std::vector <float_t> gofs(ind.size());
+	buffer_site.unmaskall();
+	*buffer_mle = estimate(buffer_site, model, gofs, MIN, EMLMIN, MINGOF, MAXPITCH);
+	if (2 * (buffer_mle->ll - buffer_mle->monoll) >= 22) {
+		for (size_t i = 0; i < sum_gofs.size(); i++) {
+			sum_gofs[i] += gofs[i];
+			if (gofs[i] != 0) gofs_read[i]++;
+		}
+	}
+
+}
+
 int estimateInd(int argc, char *argv[])
 {
 
@@ -159,6 +214,12 @@ int estimateInd(int argc, char *argv[])
 					//which are files containing set of read 'quartets' that specify the number of 
 					//A,C,G and T read at some specific location in a genome. See proFile.h for more info.
 
+	MPI_Init(&argc, &argv);
+
+	int   numtasks, taskid;
+	MPI_Comm_size(MPI_COMM_WORLD, &numtasks);
+	MPI_Comm_rank(MPI_COMM_WORLD, &taskid);
+
 	//gcfile out;
 	std::ostream *out=&std::cout;
 	std::ofstream outFile;
@@ -185,7 +246,7 @@ int estimateInd(int argc, char *argv[])
 	char cdel='\t';
 	char qdel='/';
 	bool binary=false;
-	if (outfilepro.size()!=0) {				//Same sort of stuff for the outf
+	if (taskid == 0 && outfilepro.size()!=0) {				//Same sort of stuff for the outf
 		if (binary) {
 			pro_out.open(outfilepro.c_str(), std::fstream::out | std::fstream::binary);
 			if (!pro_out.is_open() ) {printUsage(env); exit(0);}
@@ -203,7 +264,7 @@ int estimateInd(int argc, char *argv[])
 
 
 	/* this is the basic header of our outfile, should probably be moved over to a method in allele_stat.*/
-	if (not (noheader) ){
+	if (not (noheader) and taskid == 0){
 			std::string id1="id1\t";
 			switch (pro.get_columns()) {
 				case 5:
@@ -229,66 +290,73 @@ int estimateInd(int argc, char *argv[])
 	allele_stat buffer_mle[BUFFER_SIZE]; 
 	Locus buffer_site[BUFFER_SIZE];
 	uint32_t all_read=0;
-	while (true){			//reads the next line of the pro file. pro.read() retuerns 0
-		uint32_t c=0, readed=0;
-		bool estimate_me=1;
-		#ifdef PRAGMA
-		#pragma omp parallel private(c, model, estimate_me) 
-		#endif
+	size_t line_id = 0;
+	while (true) {			//reads the next line of the pro file. pro.read() retuerns 0
+		uint32_t c = 0, readed = 0;
+		if (mpi_select(line_id, taskid, numtasks))
 		{
-			#ifdef PRAGMA
-			#pragma omp for
-			#endif
-			for (uint32_t x=0; x<BUFFER_SIZE; ++x){
-				#ifdef PRAGMA
-				#pragma omp critical
-				#endif
+			for (uint32_t x = 0; x < BUFFER_SIZE; ++x) {
+				c = readed;				//Turn on the ability to read data from all clones in 
+				if (pro.read(buffer_site[c]) != EOF) {
+					readed++;	//reads the next line of the pro file. pro.read() retuerns 0
+					line_id++;
+					do_estimate(&buffer_mle[c], buffer_site[c], model, ind, sum_gofs, gofs_read, MIN, EMLMIN, MINGOF, MAXPITCH);
+				}
+			}
+			if (taskid > 0)
+			{
+				std::cerr << "Sending from task " << taskid << " - last line " << line_id << '\n';
+				std::ostringstream ost;
+				write(ost, readed, pro, pro_out, buffer_mle, buffer_site, MINGOF, A);
+				MPI_Send((void *)ost.str().c_str(), ost.str().length(), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+			}
+			else
+			{
+				std::cerr << "Task 0 writing - last line " << line_id << '\n';
+				write(*out, readed, pro, pro_out, buffer_mle, buffer_site, MINGOF, A);
+				for (int i = 1; i < numtasks; ++i)
 				{
-					c=readed;				//Turn on the ability to read data from all clones in 
-					if(pro.read(buffer_site[c])!=EOF){
-						readed++;	//reads the next line of the pro file. pro.read() retuerns 0
-						estimate_me=1;
-					}
-					else estimate_me=0;
-				}
-				if(estimate_me) {
-					std::vector <float_t> gofs(ind.size() );
-					buffer_site[c].unmaskall(); 
-					buffer_mle[c]=estimate (buffer_site[c], model, gofs, MIN, EMLMIN, MINGOF, MAXPITCH);
-					#ifdef PRAGMA
-					#pragma omp critical
-					#endif
-					if (2*(buffer_mle[c].ll-buffer_mle[c].monoll)>=22){
-						for (size_t i=0; i<sum_gofs.size(); i++){
-							sum_gofs[i]+=gofs[i];
-							if (gofs[i]!=0) gofs_read[i]++;
-						}
-					}
+					std::cerr << "Recieving from task " << i << "\n";
+					std::istringstream ist(mpi_recieve_string(i));
+					*out << ist.str();
 				}
 			}
-
 		}
-                for (uint32_t x=0; x<readed; ++x){
-                	// Now print everything to the *out stream, which could be a file or the stdout. 
-			//TODO move this over into a formated file.
-			//?
-			if (2*(buffer_mle[x].ll-buffer_mle[x].monoll)>=A){
-				*out << std::fixed << std::setprecision(6) << pro.getids(buffer_site[x]) << '\t' << buffer_site[x].getname(0) << '\t' << buffer_site[x].getname_gt(1) << '\t';
-				*out << std::fixed << std::setprecision(6) << buffer_mle[x] << std::endl;
-			}
-			if (buffer_mle[x].gof<-MINGOF) buffer_site[x].maskall(); 
-			if (pro_out.is_open() ){
-				buffer_site[x].id0=pro_out.encodeid0(pro.decodeid0(buffer_site[x].id0) );
-				pro_out.write(buffer_site[x]);
+		else
+		{
+			// skip lines until our next stride
+			for (uint32_t x = 0; x < BUFFER_SIZE; ++x) {
+				c = readed;	
+				if (pro.read(buffer_site[c]) != EOF) {
+					readed++;
+					line_id++;
+				}
 			}
 		}
-		if (readed!=BUFFER_SIZE){break;}
+		if (readed!=BUFFER_SIZE)
+		{
+			if (taskid > 0)
+			{
+				std::cerr << "Task " << taskid << " complete\n";
+				std::ostringstream ost;
+				write(ost, readed, pro, pro_out, buffer_mle, buffer_site, MINGOF, A);
+				MPI_Send("", 0, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+			}
+			break;
+		}
 		all_read+=readed;
 		if (all_read>stop){break;}
 	}
-	for (size_t x=0; x<ind.size(); ++x)  *out << "@" << pro.get_sample_name(ind[x]) << ":" << sum_gofs[x]/(float_t(gofs_read[x])) << std::endl;
+	if (taskid == 0)
+	{
+		for (size_t x=0; x<ind.size(); ++x)  
+			*out << "@" << pro.get_sample_name(ind[x]) << ":" << sum_gofs[x]/(float_t(gofs_read[x])) << std::endl;
+	}
 	pro.close();
 	if (outFile.is_open()) outFile.close();		//Closes outFile iff outFile is open.
 	if (pro_out.is_open()) pro_out.close();		//Closes pro_out iff pro_out is open.
+
+	MPI_Finalize();
+
 	return 0;					//Since everything worked, return 0!.
 }

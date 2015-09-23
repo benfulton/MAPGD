@@ -633,7 +633,6 @@ int profile::readt(Locus &site){
 						std::cerr << column.size() << " fields found." << std::endl;
 						std::cerr << "delimiter : \'" << delim_column << "\'" << std::endl;
 						std::cerr << "columns : \'" << columns_ << "\'" << std::endl;
-						exit(0);
 						return EOF;
 					}
 					site.id1=encodeid1(column[0]);
@@ -658,7 +657,6 @@ int profile::readt(Locus &site){
 				std::cerr << column.size() << " fields found." << std::endl;
 				std::cerr << "delimiter : \'" << delim_column << "\'" << std::endl;
 				std::cerr << "columns : \'" << columns_ << "\'" << std::endl;
-				exit(0);
 				return EOF;
 			};
 			site.id0=encodeid0(column[0]);
@@ -678,7 +676,6 @@ int profile::readt(Locus &site){
 				std::cerr << column.size() << " fields found." << std::endl;
 				std::cerr << "delimiter : \'" << delim_column << "\'" << std::endl;
 				std::cerr << "columns : \'" << columns_ << "\'" << std::endl;
-				exit(0);
 				return EOF;
 			};
 			site.id0=encodeid0(column[0]);

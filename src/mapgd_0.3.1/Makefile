@@ -8,7 +8,7 @@ LOCAL=../../bin/mapgd
 WARNINGS=-Wall -Werror=return-type -Wno-write-strings
 CXXFLAGS=$(STD) $(MODE) $(WARNINGS) -fopenmp
 DEBUG= -g 
-CXX=g++
+CXX=mpiCC
 
 
 #>! TODO ORGANIZE THESE!!
