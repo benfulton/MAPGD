@@ -26,6 +26,8 @@ Output File: two columns of site identifiers; reference allele; major allele; mi
 #define BUFFER_SIZE 500
 #define PRAGMA
 
+enum MESSAGE_TAGS { MAPGD_LINES=1, MAPGD_GOFS };
+
 /*
 float_t compare (allele_stat mle1, allele_stat mle2, Locus &site1, Locus &site2,  models &model){
 	Locus site3=site1+site2;
@@ -135,7 +137,7 @@ std::string mpi_recieve_string(int rank)
 	int count;
 	MPI_Get_count(&status, MPI_CHAR, &count);
 	char *buf = new char[count];
-	MPI_Recv(buf, count, MPI_CHAR, rank, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	MPI_Recv(buf, count, MPI_CHAR, rank, MAPGD_LINES, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 	std::string result(buf, count);
 	delete[] buf;
 	return result;
@@ -308,7 +310,7 @@ int estimateInd(int argc, char *argv[])
 				std::cerr << "Sending from task " << taskid << " - last line " << line_id << '\n';
 				std::ostringstream ost;
 				write(ost, readed, pro, pro_out, buffer_mle, buffer_site, MINGOF, A);
-				MPI_Send((void *)ost.str().c_str(), ost.str().length(), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+				MPI_Send((void *)ost.str().c_str(), ost.str().length(), MPI_CHAR, 0, MAPGD_LINES, MPI_COMM_WORLD);
 			}
 			else
 			{
@@ -337,10 +339,9 @@ int estimateInd(int argc, char *argv[])
 		{
 			if (taskid > 0)
 			{
-				std::cerr << "Task " << taskid << " complete\n";
 				std::ostringstream ost;
 				write(ost, readed, pro, pro_out, buffer_mle, buffer_site, MINGOF, A);
-				MPI_Send("", 0, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+				MPI_Send("", 0, MPI_CHAR, 0, MAPGD_LINES, MPI_COMM_WORLD);
 			}
 			break;
 		}
@@ -349,8 +350,29 @@ int estimateInd(int argc, char *argv[])
 	}
 	if (taskid == 0)
 	{
-		for (size_t x=0; x<ind.size(); ++x)  
-			*out << "@" << pro.get_sample_name(ind[x]) << ":" << sum_gofs[x]/(float_t(gofs_read[x])) << std::endl;
+		// accumulate sum_gofs and gofs_read from all the running tasks
+		for (int i = 1; i < numtasks; ++i)
+		{
+			std::vector<float_t> recv(ind.size() * 2);
+			MPI_Recv(recv.data(), recv.size(), MPI_FLOAT, MPI_ANY_SOURCE, MAPGD_GOFS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			std::cerr << "Recieved GOF data\n";
+			for (size_t x = 0; x < ind.size(); ++x)
+			{
+				gofs_read[x] += recv[x];
+				sum_gofs[x] += recv[x + ind.size()];
+			}
+		}
+		for (size_t x = 0; x<ind.size(); ++x)
+			*out << "@" << pro.get_sample_name(ind[x]) << ":" << sum_gofs[x] / (float_t(gofs_read[x])) << std::endl;
+	}
+	else
+	{
+		std::vector<float_t> send(ind.size()*2);
+		std::copy(gofs_read.begin(), gofs_read.end(), send.begin());
+		std::copy(sum_gofs.begin(), sum_gofs.end(), send.begin()+ind.size());
+		std::cerr << "Task " << taskid << " sending GOF data\n";
+		MPI_Send(send.data(), send.size(), MPI_FLOAT, 0, MAPGD_GOFS, MPI_COMM_WORLD);
+
 	}
 	pro.close();
 	if (outFile.is_open()) outFile.close();		//Closes outFile iff outFile is open.
